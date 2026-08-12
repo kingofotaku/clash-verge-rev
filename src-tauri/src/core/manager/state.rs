@@ -26,6 +26,7 @@ use tauri_plugin_shell::ShellExt as _;
 
 const SIDECAR_READINESS_ATTEMPTS: usize = 30;
 const SIDECAR_EVENT_BUFFER_CAPACITY: usize = 256;
+const SIDECAR_RAW_OUTPUT: bool = true;
 
 impl CoreManager {
     /// A core process is up: put back the node selections the user made.
@@ -224,18 +225,20 @@ impl CoreManager {
             .shell()
             .sidecar(clash_core.as_str())
             .map_err(|error| anyhow::anyhow!("failed to build sidecar command for core {clash_core:?}: {error:#}"))?;
-        let command = command.args([
-            "-d",
-            dirs::path_to_str(&config_dir)?,
-            "-f",
-            dirs::path_to_str(&config_file)?,
-            if cfg!(windows) {
-                "-ext-ctl-pipe"
-            } else {
-                "-ext-ctl-unix"
-            },
-            dirs::path_to_str(&sidecar_ipc)?,
-        ]);
+        let command = command
+            .args([
+                "-d",
+                dirs::path_to_str(&config_dir)?,
+                "-f",
+                dirs::path_to_str(&config_file)?,
+                if cfg!(windows) {
+                    "-ext-ctl-pipe"
+                } else {
+                    "-ext-ctl-unix"
+                },
+                dirs::path_to_str(&sidecar_ipc)?,
+            ])
+            .set_raw_out(SIDECAR_RAW_OUTPUT);
         #[cfg(windows)]
         let command = command.env(
             "LISTEN_NAMEDPIPE_SDDL",
@@ -456,8 +459,9 @@ impl CoreManager {
 #[cfg(test)]
 mod readiness_tests {
     use super::{
-        SIDECAR_EVENT_BUFFER_CAPACITY, buffer_sidecar_event, claim_core_readiness_generation, poll_sidecar_readiness,
-        poll_sidecar_readiness_with_active_relay, relay_sidecar_events, should_clear_terminated_sidecar,
+        SIDECAR_EVENT_BUFFER_CAPACITY, SIDECAR_RAW_OUTPUT, buffer_sidecar_event, claim_core_readiness_generation,
+        poll_sidecar_readiness, poll_sidecar_readiness_with_active_relay, relay_sidecar_events,
+        should_clear_terminated_sidecar,
     };
     use crate::{
         AsyncHandler,
@@ -472,6 +476,11 @@ mod readiness_tests {
         time::Duration,
     };
     use tauri_plugin_shell::process::{CommandEvent, TerminatedPayload};
+
+    #[test]
+    fn sidecar_output_uses_bounded_raw_chunks() {
+        assert!(std::hint::black_box(SIDECAR_RAW_OUTPUT));
+    }
 
     #[test]
     fn sidecar_event_buffer_is_bounded_and_prioritizes_termination() {

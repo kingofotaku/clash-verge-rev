@@ -62,13 +62,17 @@ jobs:
       - name: Run Sidecar startup event relay regression test
         shell: pwsh
         run: |
-          cargo test -p clash-verge --lib core::manager::state --no-default-features --no-run
+          cargo test -p clash-verge --lib core::manager::state --no-default-features --no-run --message-format=json-render-diagnostics > target\sidecar-test-artifacts.jsonl
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $testExe = Get-ChildItem target\debug\deps\app_lib-*.exe |
-            Sort-Object LastWriteTime |
-            Select-Object -Last 1
-          if ($null -eq $testExe) { throw "Rust test executable was not produced" }
+          $testExecutables = Get-Content target\sidecar-test-artifacts.jsonl |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'app_lib' -and $_.profile.test -and $_.executable } |
+            Select-Object -ExpandProperty executable -Unique
+          if (@($testExecutables).Count -ne 1) {
+            throw "Expected exactly one current app_lib test executable, got $(@($testExecutables).Count)"
+          }
+          $testExe = Get-Item -LiteralPath $testExecutables
 
           $manifest = "$($testExe.FullName).manifest"
           @'
@@ -89,8 +93,15 @@ jobs:
           & $mt.FullName -nologo -manifest $manifest "-outputresource:$($testExe.FullName);#1"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & $testExe.FullName "core::manager::state::" --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testOutput = & $testExe.FullName "core::manager::state::" --nocapture 2>&1
+          $testExitCode = $LASTEXITCODE
+          $testOutput | Write-Output
+          if ($testExitCode -ne 0) { exit $testExitCode }
+          $summary = $testOutput | Where-Object { $_ -match '^test result: ok\. (\d+) passed;' } | Select-Object -Last 1
+          $summaryMatch = [regex]::Match([string]$summary, '^test result: ok\. (\d+) passed;')
+          if (-not $summaryMatch.Success -or [int]$summaryMatch.Groups[1].Value -lt 11) {
+            throw "Expected at least 11 Sidecar state tests to run"
+          }
 
       - name: Set identifiable development version
         run: pnpm release-version deploytest
