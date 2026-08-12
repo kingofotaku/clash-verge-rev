@@ -55,8 +55,8 @@ jobs:
       - name: Run admin Sidecar TUN regression test
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          cargo test -p clash-verge elevated_windows_tun_does_not_require_an_absent_service --lib --target x86_64-pc-windows-msvc
+          rustc --edition=2024 --test src-tauri/src/core/manager/startup_policy.rs -o target/startup-policy-tests.exe
+          & .\target\startup-policy-tests.exe
 
       - name: Set identifiable development version
         run: pnpm release-version deploytest

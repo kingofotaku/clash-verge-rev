@@ -1,5 +1,6 @@
 mod config;
 mod lifecycle;
+mod startup_policy;
 mod state;
 
 use anyhow::Result;
