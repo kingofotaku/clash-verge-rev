@@ -70,7 +70,7 @@ jobs:
           --bundles nsis
           --no-sign
           --ci
-          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          --config src-tauri/tauri.unsigned.conf.json
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v7
