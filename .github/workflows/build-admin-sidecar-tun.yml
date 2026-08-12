@@ -1,0 +1,82 @@
+name: Build admin Sidecar TUN fix
+
+on:
+  push:
+    branches:
+      - fix/admin-sidecar-tun
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  HUSKY: 0
+  NODE_OPTIONS: --max_old_space_size=4096
+
+jobs:
+  windows-x64-nsis:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout patched source
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: admin-sidecar-tun-x64
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+
+      - name: Install Node.js 24.19.0
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.19.0
+          cache: pnpm
+
+      - name: Install dependencies and official sidecars
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run prebuild x86_64-pc-windows-msvc
+
+      - name: Run admin Sidecar TUN regression test
+        shell: pwsh
+        run: >-
+          cargo test -p clash-verge
+          elevated_windows_tun_does_not_require_an_absent_service
+          --lib --target x86_64-pc-windows-msvc
+
+      - name: Set identifiable development version
+        run: pnpm release-version deploytest
+
+      - name: Build unsigned Windows x64 NSIS installer
+        shell: pwsh
+        run: >-
+          pnpm exec tauri build
+          --target x86_64-pc-windows-msvc
+          --bundles nsis
+          --no-sign
+          --ci
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: clash-verge-admin-sidecar-tun-x64
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          archive: false
+          retention-days: 14

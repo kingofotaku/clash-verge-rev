@@ -18,6 +18,10 @@ const fn should_wait_for_service(tun_enabled: bool, service_ready: bool, is_admi
     tun_enabled && !service_ready && !is_admin
 }
 
+const fn service_required_for_startup(tun_enabled: bool, tun_suppressed: bool, is_admin: bool) -> bool {
+    tun_enabled && !tun_suppressed && !is_admin
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupDecision {
     Service,
@@ -556,8 +560,13 @@ impl CoreManager {
         #[cfg(target_os = "windows")]
         self.wait_for_service_if_needed().await;
 
-        let service_required = Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false)
-            && !Config::tun_suppressed_for_session();
+        let tun_enabled = Config::verge().await.latest_arc().enable_tun_mode.unwrap_or(false);
+        let tun_suppressed = Config::tun_suppressed_for_session();
+        #[cfg(target_os = "windows")]
+        let is_admin = is_current_app_handle_admin(Handle::app_handle());
+        #[cfg(not(target_os = "windows"))]
+        let is_admin = false;
+        let service_required = service_required_for_startup(tun_enabled, tun_suppressed, is_admin);
         if service_required
             && matches!(SERVICE_MANAGER.current().await, ServiceStatus::NotInstalled)
             && SERVICE_MANAGER.require_install_for_session().is_err()
@@ -764,7 +773,7 @@ mod tests {
         CoreManager, ProxyRestoreExpectation, StartupDecision, can_allow_sidecar_for_session,
         run_controlled_stop_transition, run_core_replacement_transition, run_core_start_transition,
         run_ready_core_start_transition, run_service_config_replacement_transition, run_sidecar_termination_transition,
-        run_uninstall_transition, should_wait_for_service, startup_decision,
+        run_uninstall_transition, service_required_for_startup, should_wait_for_service, startup_decision,
     };
     use crate::core::{manager::RunningMode, service::ServiceStatus};
     use parking_lot::Mutex;
@@ -1239,6 +1248,27 @@ mod tests {
         assert!(!should_wait_for_service(true, false, true));
         assert!(!should_wait_for_service(true, true, false));
         assert!(!should_wait_for_service(false, false, false));
+    }
+
+    #[test]
+    fn elevated_windows_tun_does_not_require_an_absent_service() {
+        assert!(!service_required_for_startup(true, false, true));
+        assert_eq!(
+            startup_decision(
+                &ServiceStatus::NotInstalled,
+                service_required_for_startup(true, false, true),
+            ),
+            StartupDecision::Sidecar,
+        );
+
+        assert!(service_required_for_startup(true, false, false));
+        assert_eq!(
+            startup_decision(
+                &ServiceStatus::NotInstalled,
+                service_required_for_startup(true, false, false),
+            ),
+            StartupDecision::Wait,
+        );
     }
 
     #[test]
