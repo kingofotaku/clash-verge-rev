@@ -55,6 +55,7 @@ jobs:
       - name: Run admin Sidecar TUN regression test
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force target | Out-Null
           rustc --edition=2024 --test src-tauri/src/core/manager/startup_policy.rs -o target/startup-policy-tests.exe
           & .\target\startup-policy-tests.exe
 
