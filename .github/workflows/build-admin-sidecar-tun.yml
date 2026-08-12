@@ -59,6 +59,39 @@ jobs:
           rustc --edition=2024 --test src-tauri/src/core/manager/startup_policy.rs -o target/startup-policy-tests.exe
           & .\target\startup-policy-tests.exe
 
+      - name: Run Sidecar startup event relay regression test
+        shell: pwsh
+        run: |
+          cargo test -p clash-verge --lib core::manager::state --no-default-features --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $testExe = Get-ChildItem target\debug\deps\app_lib-*.exe |
+            Sort-Object LastWriteTime |
+            Select-Object -Last 1
+          if ($null -eq $testExe) { throw "Rust test executable was not produced" }
+
+          $manifest = "$($testExe.FullName).manifest"
+          @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <dependency>
+              <dependentAssembly>
+                <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="amd64" publicKeyToken="6595b64144ccf1df" language="*" />
+              </dependentAssembly>
+            </dependency>
+          </assembly>
+          '@ | Set-Content -LiteralPath $manifest -Encoding utf8
+
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } |
+            Select-Object -Last 1
+          if ($null -eq $mt) { throw "Windows SDK mt.exe was not found" }
+          & $mt.FullName -nologo -manifest $manifest "-outputresource:$($testExe.FullName);#1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExe.FullName "core::manager::state::" --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Set identifiable development version
         run: pnpm release-version deploytest
 

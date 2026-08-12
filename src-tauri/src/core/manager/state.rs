@@ -13,11 +13,19 @@ use clash_verge_logging::Type;
 use compact_str::CompactString;
 use log::Level;
 use scopeguard::defer;
-use std::path::Path;
+use std::{
+    collections::VecDeque,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tauri_plugin_mihomo::MihomoExt as _;
 use tauri_plugin_shell::ShellExt as _;
 
 const SIDECAR_READINESS_ATTEMPTS: usize = 30;
+const SIDECAR_EVENT_BUFFER_CAPACITY: usize = 256;
 
 impl CoreManager {
     /// A core process is up: put back the node selections the user made.
@@ -76,6 +84,101 @@ where
 
 fn should_clear_terminated_sidecar(running_mode: &RunningMode, current_pid: Option<u32>, terminated_pid: u32) -> bool {
     matches!(running_mode, RunningMode::Sidecar) && current_pid == Some(terminated_pid)
+}
+
+struct SidecarEventQueue {
+    events: Mutex<VecDeque<tauri_plugin_shell::process::CommandEvent>>,
+    source_closed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+struct SidecarEventReceiver {
+    queue: Arc<SidecarEventQueue>,
+    relay_task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl SidecarEventReceiver {
+    async fn recv(&self) -> Option<tauri_plugin_shell::process::CommandEvent> {
+        loop {
+            let notified = self.queue.notify.notified();
+            let event = self
+                .queue
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            if let Some(event) = event {
+                return Some(event);
+            }
+            if self.queue.source_closed.load(Ordering::Acquire) {
+                return None;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for SidecarEventReceiver {
+    fn drop(&mut self) {
+        self.relay_task.abort();
+    }
+}
+
+fn buffer_sidecar_event(
+    buffered: &mut VecDeque<tauri_plugin_shell::process::CommandEvent>,
+    event: tauri_plugin_shell::process::CommandEvent,
+) {
+    if matches!(event, tauri_plugin_shell::process::CommandEvent::Terminated(_)) {
+        buffered.clear();
+    } else if matches!(
+        buffered.front(),
+        Some(tauri_plugin_shell::process::CommandEvent::Terminated(_))
+    ) {
+        return;
+    } else if buffered.len() == SIDECAR_EVENT_BUFFER_CAPACITY {
+        buffered.pop_front();
+    }
+    buffered.push_back(event);
+}
+
+fn relay_sidecar_events(
+    mut source: tauri::async_runtime::Receiver<tauri_plugin_shell::process::CommandEvent>,
+) -> SidecarEventReceiver {
+    let queue = Arc::new(SidecarEventQueue {
+        events: Mutex::new(VecDeque::with_capacity(SIDECAR_EVENT_BUFFER_CAPACITY)),
+        source_closed: AtomicBool::new(false),
+        notify: tokio::sync::Notify::new(),
+    });
+    let relay_queue = Arc::clone(&queue);
+    let relay_task = AsyncHandler::spawn(move || async move {
+        while let Some(event) = source.recv().await {
+            buffer_sidecar_event(
+                &mut relay_queue
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                event,
+            );
+            relay_queue.notify.notify_one();
+        }
+        relay_queue.source_closed.store(true, Ordering::Release);
+        relay_queue.notify.notify_one();
+    });
+    SidecarEventReceiver { queue, relay_task }
+}
+
+async fn poll_sidecar_readiness_with_active_relay<F, Fut>(
+    receiver: SidecarEventReceiver,
+    max_attempts: usize,
+    retry_delay: std::time::Duration,
+    probe: F,
+) -> (Result<()>, SidecarEventReceiver)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let readiness = poll_sidecar_readiness(max_attempts, retry_delay, probe).await;
+    (readiness, receiver)
 }
 
 #[cfg(target_os = "windows")]
@@ -138,13 +241,17 @@ impl CoreManager {
             "LISTEN_NAMEDPIPE_SDDL",
             crate::core::owner_identity::current_user_pipe_sddl()?,
         );
-        let (mut rx, child) = command.spawn().map_err(|error| {
+        let (rx, child) = command.spawn().map_err(|error| {
             anyhow::anyhow!(
                 "failed to start sidecar core {clash_core:?} with config {} and data directory {}: {error:#}",
                 config_file.display(),
                 config_dir.display()
             )
         })?;
+        // The shell plugin's event channel has capacity one. Start draining it immediately,
+        // before synchronous Job Object setup, because Mihomo can block on startup logs before
+        // its API begins listening.
+        let rx = relay_sidecar_events(rx);
         #[cfg(target_os = "windows")]
         let job = {
             match create_and_assign_sidecar_job(child.pid()) {
@@ -174,14 +281,19 @@ impl CoreManager {
         let pid = child.pid();
         logging!(trace, Type::Core, "Sidecar started with PID: {}", pid);
 
-        let readiness = poll_sidecar_readiness(SIDECAR_READINESS_ATTEMPTS, SIDECAR_READINESS_INTERVAL, || async {
-            tokio::time::timeout(SIDECAR_READINESS_PROBE_TIMEOUT, async {
-                handle::Handle::mihomo().get_version().await
-            })
-            .await
-            .context("Mihomo readiness probe timed out")??;
-            Ok(())
-        })
+        let (readiness, rx) = poll_sidecar_readiness_with_active_relay(
+            rx,
+            SIDECAR_READINESS_ATTEMPTS,
+            SIDECAR_READINESS_INTERVAL,
+            || async {
+                tokio::time::timeout(SIDECAR_READINESS_PROBE_TIMEOUT, async {
+                    handle::Handle::mihomo().get_version().await
+                })
+                .await
+                .context("Mihomo readiness probe timed out")??;
+                Ok(())
+            },
+        )
         .await;
         if let Err(readiness_error) = readiness {
             proxy_control::stop_guard().await;
@@ -343,8 +455,15 @@ impl CoreManager {
 
 #[cfg(test)]
 mod readiness_tests {
-    use super::{claim_core_readiness_generation, poll_sidecar_readiness, should_clear_terminated_sidecar};
-    use crate::core::manager::{CoreManager, RunningMode};
+    use super::{
+        SIDECAR_EVENT_BUFFER_CAPACITY, buffer_sidecar_event, claim_core_readiness_generation, poll_sidecar_readiness,
+        poll_sidecar_readiness_with_active_relay, relay_sidecar_events, should_clear_terminated_sidecar,
+    };
+    use crate::{
+        AsyncHandler,
+        core::manager::{CoreManager, RunningMode},
+    };
+    use anyhow::Context as _;
     use std::{
         sync::{
             Arc,
@@ -352,6 +471,130 @@ mod readiness_tests {
         },
         time::Duration,
     };
+    use tauri_plugin_shell::process::{CommandEvent, TerminatedPayload};
+
+    #[test]
+    fn sidecar_event_buffer_is_bounded_and_prioritizes_termination() {
+        let mut buffered = std::collections::VecDeque::new();
+        for value in 0..(SIDECAR_EVENT_BUFFER_CAPACITY * 2) {
+            buffer_sidecar_event(
+                &mut buffered,
+                CommandEvent::Stdout((value as u64).to_le_bytes().to_vec()),
+            );
+        }
+        assert_eq!(buffered.len(), SIDECAR_EVENT_BUFFER_CAPACITY);
+
+        buffer_sidecar_event(
+            &mut buffered,
+            CommandEvent::Terminated(TerminatedPayload {
+                code: Some(17),
+                signal: None,
+            }),
+        );
+        assert_eq!(buffered.len(), 1);
+        assert!(matches!(
+            buffered.front(),
+            Some(CommandEvent::Terminated(TerminatedPayload { code: Some(17), .. }))
+        ));
+        buffer_sidecar_event(&mut buffered, CommandEvent::Stdout(vec![99]));
+        assert_eq!(buffered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sidecar_readiness_starts_event_relay_before_waiting_for_api() -> anyhow::Result<()> {
+        let (source_tx, source_rx) = tauri::async_runtime::channel(1);
+        let producer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer_done_signal = Arc::new(tokio::sync::Notify::new());
+        let producer_finished = Arc::clone(&producer_done);
+        let producer_finished_signal = Arc::clone(&producer_done_signal);
+        AsyncHandler::spawn(move || async move {
+            for value in 0_u8..128 {
+                if source_tx.send(CommandEvent::Stdout(vec![value])).await.is_err() {
+                    return;
+                }
+            }
+            producer_finished.store(true, Ordering::Release);
+            producer_finished_signal.notify_waiters();
+        });
+
+        let relayed = relay_sidecar_events(source_rx);
+        let startup = tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_sidecar_readiness_with_active_relay(relayed, 1, Duration::ZERO, move || {
+                let producer_done = Arc::clone(&producer_done);
+                let producer_done_signal = Arc::clone(&producer_done_signal);
+                async move {
+                    let notified = producer_done_signal.notified();
+                    if !producer_done.load(Ordering::Acquire) {
+                        notified.await;
+                    }
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .context("readiness blocked before the startup event relay began")?;
+        let (readiness, relayed) = startup;
+        readiness?;
+
+        for expected in 0_u8..128 {
+            let event = relayed.recv().await.context("expected buffered startup event")?;
+            let CommandEvent::Stdout(actual) = event else {
+                anyhow::bail!("expected relayed stdout event, got {event:?}");
+            };
+            assert_eq!(actual, vec![expected]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_sidecar_event_receiver_cancels_the_relay() -> anyhow::Result<()> {
+        let (source_tx, source_rx) = tauri::async_runtime::channel(1);
+        let relayed = relay_sidecar_events(source_rx);
+        drop(relayed);
+
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            loop {
+                if source_tx.send(CommandEvent::Stdout(vec![1])).await.is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("relay task kept the source channel alive after its consumer was dropped")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sidecar_event_relay_drains_bounded_source_before_downstream_consumes() -> anyhow::Result<()> {
+        let (source_tx, source_rx) = tauri::async_runtime::channel(1);
+        let relayed = relay_sidecar_events(source_rx);
+
+        // Tauri's shell plugin exposes process output through a channel with capacity one.
+        // Mihomo can emit hundreds of startup lines before its API starts listening, so the
+        // producer must finish even while readiness delays downstream log handling.
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            for value in 0_u8..128 {
+                source_tx
+                    .send(CommandEvent::Stdout(vec![value]))
+                    .await
+                    .context("relay stopped draining the bounded source channel")?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("source producer blocked because startup events were not drained")??;
+
+        for expected in 0_u8..128 {
+            let event = relayed.recv().await.context("expected relayed stdout event")?;
+            let CommandEvent::Stdout(actual) = event else {
+                anyhow::bail!("expected relayed stdout event, got {event:?}");
+            };
+            assert_eq!(actual, vec![expected]);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn sidecar_readiness_poll_is_bounded_and_accepts_a_real_api_response() -> anyhow::Result<()> {
